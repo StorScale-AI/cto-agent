@@ -104,10 +104,10 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
 
-      - name: Install CTO agent dependencies
+      - name: Install and build CTO agent
         if: steps.loop-guard.outputs.skip != 'true'
         working-directory: cto-agent
-        run: npm ci
+        run: npm ci && npm run build
 
       # ── Fast Path: Pattern Matching ─────────────────────────────
       - name: Run pattern matchers
@@ -116,7 +116,7 @@ jobs:
         working-directory: cto-agent
         run: |
           node --input-type=module -e "
-            import { matchPatterns, matchAllPatterns } from './patterns/index.js';
+            import { matchPatterns, matchAllPatterns } from './dist/patterns/index.js';
             import { readFileSync } from 'fs';
 
             const logText = readFileSync('../combined-log.txt', 'utf8');
