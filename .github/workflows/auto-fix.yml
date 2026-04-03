@@ -1,0 +1,263 @@
+name: CTO Auto-Fix
+
+on:
+  workflow_call:
+    inputs:
+      repo:
+        description: 'Repository that failed (org/name format)'
+        required: true
+        type: string
+      run_id:
+        description: 'Failed workflow run ID'
+        required: true
+        type: number
+      workflow_name:
+        description: 'Name of the CI workflow that failed'
+        required: true
+        type: string
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: true
+      GH_PAT:
+        required: true
+      SLACK_WEBHOOK_URL:
+        required: false
+
+concurrency:
+  group: cto-fix-${{ inputs.repo }}
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: '22'
+  TARGET_REPO: ${{ inputs.repo }}
+  TARGET_RUN_ID: ${{ inputs.run_id }}
+  TARGET_WORKFLOW: ${{ inputs.workflow_name }}
+
+jobs:
+  auto-fix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # ── Loop Guard ──────────────────────────────────────────────
+      - name: Check for fix loop
+        id: loop-guard
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          COMMIT_MSG=$(gh api "repos/${TARGET_REPO}/actions/runs/${TARGET_RUN_ID}" \
+            --jq '.head_commit.message // ""')
+          COMMIT_AUTHOR=$(gh api "repos/${TARGET_REPO}/actions/runs/${TARGET_RUN_ID}" \
+            --jq '.head_commit.author.name // ""')
+
+          if echo "$COMMIT_MSG" | grep -q '\[cto-fix\]'; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "reason=Last commit was a CTO auto-fix — skipping to prevent loop" >> "$GITHUB_OUTPUT"
+          elif echo "$COMMIT_AUTHOR" | grep -qi 'cto-agent'; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "reason=Last commit by CTO agent — skipping to prevent loop" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Escalate if loop detected
+        if: steps.loop-guard.outputs.skip == 'true'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          LOOP_REASON: ${{ steps.loop-guard.outputs.reason }}
+        run: |
+          if [ -n "$SLACK_WEBHOOK_URL" ]; then
+            PAYLOAD=$(jq -n --arg text "CTO Agent: Auto-fix loop detected in ${TARGET_REPO}. ${LOOP_REASON}. Manual intervention needed. Run: https://github.com/${TARGET_REPO}/actions/runs/${TARGET_RUN_ID}" '{text: $text}')
+            curl -s -X POST "$SLACK_WEBHOOK_URL" -H 'Content-Type: application/json' -d "$PAYLOAD"
+          fi
+          echo "::warning::${LOOP_REASON}"
+
+      # ── Download Failure Logs ───────────────────────────────────
+      - name: Download failure logs
+        if: steps.loop-guard.outputs.skip != 'true'
+        id: logs
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          gh api "repos/${TARGET_REPO}/actions/runs/${TARGET_RUN_ID}/logs" > logs.zip || true
+          if [ -f logs.zip ]; then
+            unzip -o logs.zip -d run-logs/ 2>/dev/null || true
+            cat run-logs/*.txt > failure-log.txt 2>/dev/null || true
+          fi
+          gh api "repos/${TARGET_REPO}/actions/runs/${TARGET_RUN_ID}/annotations" \
+            --jq '.[].message' > annotations.txt 2>/dev/null || true
+          gh run view "${TARGET_RUN_ID}" --repo "${TARGET_REPO}" --log-failed > failed-log.txt 2>/dev/null || true
+          cat failure-log.txt failed-log.txt > combined-log.txt 2>/dev/null || true
+          echo "log_size=$(wc -c < combined-log.txt | tr -d ' ')" >> "$GITHUB_OUTPUT"
+
+      # ── Clone CTO Agent (for pattern matchers) ──────────────────
+      - name: Checkout CTO agent
+        if: steps.loop-guard.outputs.skip != 'true'
+        uses: actions/checkout@v6
+        with:
+          repository: StorScale-AI/cto-agent
+          token: ${{ secrets.GH_PAT }}
+          path: cto-agent
+
+      - name: Setup Node.js
+        if: steps.loop-guard.outputs.skip != 'true'
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install CTO agent dependencies
+        if: steps.loop-guard.outputs.skip != 'true'
+        working-directory: cto-agent
+        run: npm ci
+
+      # ── Fast Path: Pattern Matching ─────────────────────────────
+      - name: Run pattern matchers
+        if: steps.loop-guard.outputs.skip != 'true'
+        id: patterns
+        working-directory: cto-agent
+        run: |
+          node --input-type=module -e "
+            import { matchPatterns, matchAllPatterns } from './patterns/index.js';
+            import { readFileSync } from 'fs';
+
+            const logText = readFileSync('../combined-log.txt', 'utf8');
+            const annotations = readFileSync('../annotations.txt', 'utf8').split('\n').filter(Boolean);
+
+            const result = matchPatterns(logText, annotations);
+            const allResults = matchAllPatterns(logText, annotations);
+
+            console.log(JSON.stringify({
+              matched: result !== null,
+              result,
+              allResults: allResults.map(r => ({ name: r.patternName, confidence: r.confidence }))
+            }));
+          " > ../pattern-result.json
+
+          MATCHED=$(node -e "console.log(JSON.parse(require('fs').readFileSync('../pattern-result.json','utf8')).matched)")
+          echo "matched=${MATCHED}" >> "$GITHUB_OUTPUT"
+
+      # ── Clone Target Repo ───────────────────────────────────────
+      - name: Checkout target repo
+        if: steps.loop-guard.outputs.skip != 'true'
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.repo }}
+          token: ${{ secrets.GH_PAT }}
+          path: target-repo
+
+      # ── Slow Path: Claude Code ──────────────────────────────────
+      - name: Claude Code auto-fix
+        if: steps.loop-guard.outputs.skip != 'true' && steps.patterns.outputs.matched != 'true'
+        id: claude-fix
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            You are the CTO Agent for StorScale. A CI workflow failed and no pattern matcher could fix it.
+
+            Repository: ${{ inputs.repo }}
+            Workflow: ${{ inputs.workflow_name }}
+
+            Read the file combined-log.txt and annotations.txt in the parent directory for failure details.
+
+            YOUR TASK:
+            1. Diagnose the root cause of the CI failure
+            2. Write a minimal fix (max 5 files, max 100 lines changed)
+            3. Write a regression test that would catch this failure
+            4. Apply the fix
+            5. Do NOT modify .env files or hardcode secrets
+            6. Do NOT delete existing tests
+
+            If you cannot fix this safely, create a file called ESCALATE.txt with the reason.
+          working_directory: target-repo
+          allowed_tools: 'Bash,Read,Write,Edit,Glob,Grep'
+          timeout_minutes: 10
+
+      # ── Validate & Push Fix ─────────────────────────────────────
+      - name: Validate and push fix
+        if: steps.loop-guard.outputs.skip != 'true'
+        id: push
+        working-directory: target-repo
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          # Check for escalation
+          if [ -f ESCALATE.txt ]; then
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
+            echo "reason=Claude escalated: $(cat ESCALATE.txt)" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Check if there are changes
+          if git diff --quiet && git diff --cached --quiet; then
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
+            echo "reason=No changes to push" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Validate diff size
+          FILES_CHANGED=$(git diff --name-only | wc -l | tr -d ' ')
+          LINES_CHANGED=$(git diff --numstat | awk '{s+=$1+$2}END{print s+0}')
+
+          if [ "$FILES_CHANGED" -gt 5 ]; then
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
+            echo "reason=Diff too large: ${FILES_CHANGED} files (max 5)" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$LINES_CHANGED" -gt 100 ]; then
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
+            echo "reason=Diff too large: ${LINES_CHANGED} lines (max 100)" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Configure git
+          git config user.name "CTO Agent"
+          git config user.email "cto-agent@storscale.ai"
+
+          # Determine pattern name
+          PATTERN=$(node -e "try{const d=JSON.parse(require('fs').readFileSync('../pattern-result.json','utf8'));console.log(d.result?.patternName||'claude-code')}catch{console.log('claude-code')}" 2>/dev/null || echo "claude-code")
+
+          # Stage and commit
+          git add -A
+          git commit -m "$(cat <<EOF
+          [cto-fix] Auto-fix CI failure in ${TARGET_WORKFLOW}
+
+          Pattern: ${PATTERN}
+          Files changed: ${FILES_CHANGED}
+          Run: https://github.com/${TARGET_REPO}/actions/runs/${TARGET_RUN_ID}
+
+          Co-Authored-By: CTO Agent <cto-agent@storscale.ai>
+          EOF
+          )"
+
+          git push origin HEAD
+          echo "pushed=true" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "files_changed=${FILES_CHANGED}" >> "$GITHUB_OUTPUT"
+
+      # ── Slack Notification ──────────────────────────────────────
+      - name: Notify Slack
+        if: always() && steps.loop-guard.outputs.skip != 'true'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          PUSHED: ${{ steps.push.outputs.pushed }}
+          PUSH_REASON: ${{ steps.push.outputs.reason }}
+          COMMIT_SHA: ${{ steps.push.outputs.commit }}
+          FILES_COUNT: ${{ steps.push.outputs.files_changed }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then exit 0; fi
+
+          RUN_URL="https://github.com/${TARGET_REPO}/actions/runs/${TARGET_RUN_ID}"
+
+          if [ "$PUSHED" = "true" ]; then
+            SHORT_SHA="${COMMIT_SHA:0:7}"
+            PAYLOAD=$(jq -n \
+              --arg text "CTO Agent fixed CI failure in *${TARGET_REPO}*\nCommit: \`${SHORT_SHA}\` | Files: ${FILES_COUNT}\n<${RUN_URL}|View original failure>" \
+              '{attachments: [{color: "good", text: $text}]}')
+          else
+            PAYLOAD=$(jq -n \
+              --arg text "CTO Agent could not auto-fix *${TARGET_REPO}*\nReason: ${PUSH_REASON}\n<${RUN_URL}|View failure>" \
+              '{attachments: [{color: "danger", text: $text}]}')
+          fi
+
+          curl -s -X POST "$SLACK_WEBHOOK_URL" -H 'Content-Type: application/json' -d "$PAYLOAD"
