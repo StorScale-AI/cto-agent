@@ -1,6 +1,7 @@
 import { optionalEnv } from './lib/env.js';
 import { log } from './lib/logger.js';
 
+
 interface GitHubRepo {
   full_name: string;
   archived: boolean;
@@ -66,6 +67,18 @@ export async function discoverRepos(): Promise<string[]> {
     }
   } catch (e) {
     log('warn', `Failed to fetch personal repos: ${e}`);
+  }
+
+  // T4.29: Filter to allowed orgs if MONITORED_ORGS is set
+  const allowedOrgs = optionalEnv('MONITORED_ORGS');
+  if (allowedOrgs) {
+    const orgList = allowedOrgs.split(',').map(o => o.trim().toLowerCase());
+    const filtered = repos.filter(r => {
+      const org = r.split('/')[0].toLowerCase();
+      return orgList.includes(org);
+    });
+    log('info', `Filtered to ${filtered.length} repos from allowed orgs: ${orgList.join(', ')}`);
+    return filtered;
   }
 
   log('info', `Discovered repos: ${repos.join(', ')}`);

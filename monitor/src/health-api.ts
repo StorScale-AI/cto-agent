@@ -107,6 +107,7 @@ healthRoutes.get('/health/platforms', (c) => {
     platforms: [
       'github', 'render', 'stripe', 'supabase',
       'vercel', 'cloudflare', 'agents', 'domains', 'cto-self',
+      'airtable', 'attio', 'liveness',
     ],
   });
 });
@@ -149,4 +150,21 @@ healthRoutes.get('/health/history/:platform', async (c) => {
   }));
 
   return c.json({ platform, hours, points });
+});
+
+// GET /api/health/agent30-compat — returns data in Agent 30's expected format
+healthRoutes.get('/health/agent30-compat', (c) => {
+  const github = getHealth('github');
+  const render = getHealth('render');
+  const vercel = getHealth('vercel');
+  const cloudflare = getHealth('cloudflare');
+
+  return c.json({
+    github: { status: github?.status || 'unknown', details: github?.details || {} },
+    render: { status: render?.status || 'unknown', details: render?.details || {} },
+    vercel: { status: vercel?.status || 'unknown', details: vercel?.details || {} },
+    cloudflare: { status: cloudflare?.status || 'unknown', details: cloudflare?.details || {} },
+    source: 'cto-agent-monitor',
+    checked_at: new Date().toISOString(),
+  });
 });

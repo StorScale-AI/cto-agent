@@ -9,6 +9,7 @@ export interface PatternResult {
   patternName: string;
   description: string;
   confidence: number;
+  escalateOnly?: boolean;  // If true, skip Claude Code — just alert Slack
   files: FilePatch[];
   testFiles: FilePatch[];
 }

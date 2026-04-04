@@ -8,6 +8,13 @@ import * as npmAudit from './npm-audit.js';
 
 export type { PatternResult, FilePatch, PatternMatcher } from './types.js';
 
+/**
+ * Check if a match is escalation-only (should skip Claude Code).
+ */
+export function isEscalationOnly(result: PatternResult | null): boolean {
+  return result?.escalateOnly === true;
+}
+
 const CONFIDENCE_THRESHOLD = 0.8;
 
 // Ordered by specificity — most deterministic patterns first

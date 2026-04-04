@@ -24,6 +24,7 @@ export function match(logText: string, _annotations: string[]): PatternResult | 
     patternName: 'npm-audit',
     description: `npm audit found vulnerabilities: ${matches.map(m => `${m[1]} ${m[2]}`).join(', ')}`,
     confidence: 0.3, // Below threshold — will escalate
+    escalateOnly: true, // npm audit failures can't be auto-fixed safely
     files: [],
     testFiles: [],
   };

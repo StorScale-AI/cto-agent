@@ -92,8 +92,15 @@ jobs:
             --jq '.[].message' > annotations.txt 2>/dev/null || true
           gh run view "${TARGET_RUN_ID}" --repo "${TARGET_REPO}" --log-failed > failed-log.txt 2>/dev/null || true
 
-          # Sanitize logs: strip ANSI codes, truncate to 500 lines (prompt injection defense)
-          cat failure-log.txt failed-log.txt | sed 's/\x1b\[[0-9;]*m//g' | head -500 > combined-log.txt 2>/dev/null || true
+          # Sanitize logs: strip ANSI codes, prompt injection patterns, truncate
+          cat failure-log.txt failed-log.txt 2>/dev/null | \
+            sed 's/\x1b\[[0-9;]*m//g' | \
+            sed '/^[[:space:]]*<\(system\|user\|assistant\|human\|SYSTEM\|USER\|ASSISTANT\)/d' | \
+            sed '/ignore previous instructions/Id' | \
+            sed '/you are now/Id' | \
+            sed '/disregard.*above/Id' | \
+            sed '/override.*system/Id' | \
+            head -500 > combined-log.txt 2>/dev/null || true
           echo "log_size=$(wc -c < combined-log.txt | tr -d ' ')" >> "$GITHUB_OUTPUT"
 
       # ── Clone CTO Agent (for pattern matchers) ──────────────────
@@ -143,9 +150,32 @@ jobs:
           MATCHED=$(node -e "console.log(JSON.parse(require('fs').readFileSync('../pattern-result.json','utf8')).matched)")
           echo "matched=${MATCHED}" >> "$GITHUB_OUTPUT"
 
+      # ── T2.14: Escalation-only check ──────────────────────────
+      - name: Check escalation-only
+        if: steps.loop-guard.outputs.skip != 'true'
+        id: escalation-check
+        run: |
+          if [ -f ../pattern-result.json ]; then
+            ESCALATE_ONLY=$(node -e "try{const d=JSON.parse(require('fs').readFileSync('../pattern-result.json','utf8'));console.log(d.result?.escalateOnly===true?'true':'false')}catch{console.log('false')}")
+            echo "escalate_only=${ESCALATE_ONLY}" >> "$GITHUB_OUTPUT"
+          else
+            echo "escalate_only=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Notify Slack on escalation-only
+        if: steps.loop-guard.outputs.skip != 'true' && steps.escalation-check.outputs.escalate_only == 'true'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          if [ -n "$SLACK_WEBHOOK_URL" ]; then
+            DESC=$(node -e "try{const d=JSON.parse(require('fs').readFileSync('../pattern-result.json','utf8'));console.log(d.result?.description||'Unknown')}catch{console.log('Unknown')}")
+            PAYLOAD=$(jq -n --arg text "CTO Agent: Escalation-only pattern in *${TARGET_REPO}* — ${DESC}. Manual intervention required.\nhttps://github.com/${TARGET_REPO}/actions/runs/${TARGET_RUN_ID}" '{attachments: [{color: "danger", text: $text}]}')
+            curl -s -X POST "$SLACK_WEBHOOK_URL" -H 'Content-Type: application/json' -d "$PAYLOAD"
+          fi
+
       # ── Clone Target Repo ───────────────────────────────────────
       - name: Checkout target repo
-        if: steps.loop-guard.outputs.skip != 'true'
+        if: steps.loop-guard.outputs.skip != 'true' && steps.escalation-check.outputs.escalate_only != 'true'
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           repository: ${{ inputs.repo }}
@@ -156,7 +186,7 @@ jobs:
       # T1.2: Path restrictions via --disallowedTools
       # T1.7: Full TDD prompt from fix-ci-failure.md
       - name: Claude Code auto-fix
-        if: steps.loop-guard.outputs.skip != 'true'
+        if: steps.loop-guard.outputs.skip != 'true' && steps.escalation-check.outputs.escalate_only != 'true'
         id: claude-fix
         uses: anthropics/claude-code-action@d3a8d1736a61af74bee88bcac0182c49be969839 # v1
         with:
@@ -251,9 +281,45 @@ jobs:
             echo "tests_passed=true" >> "$GITHUB_OUTPUT"
           fi
 
+      # ── T3.17: Secret scan before push ────────────────────────────
+      - name: Scan for secrets in diff
+        if: steps.loop-guard.outputs.skip != 'true' && steps.test-fix.outputs.tests_passed == 'true'
+        id: secret-scan
+        working-directory: target-repo
+        run: |
+          # Check for common secret patterns in the diff
+          DIFF=$(git diff HEAD)
+          PATTERNS=(
+            'AKIA[0-9A-Z]{16}'          # AWS access key
+            'sk-[a-zA-Z0-9]{48}'        # OpenAI API key
+            'sk-ant-[a-zA-Z0-9-]{90,}'  # Anthropic API key
+            'ghp_[a-zA-Z0-9]{36}'       # GitHub PAT
+            'ghs_[a-zA-Z0-9]{36}'       # GitHub App token
+            'xoxb-[0-9]{10,}'           # Slack bot token
+            'xoxp-[0-9]{10,}'           # Slack user token
+            'sk_live_[a-zA-Z0-9]{24,}'  # Stripe live key
+            'rk_live_[a-zA-Z0-9]{24,}'  # Stripe restricted key
+            'SG\.[a-zA-Z0-9_-]{22}\.'   # SendGrid
+            'eyJ[a-zA-Z0-9_-]{20,}\.'   # JWT token (long)
+          )
+
+          FOUND=false
+          for PATTERN in "${PATTERNS[@]}"; do
+            if echo "$DIFF" | grep -qE "$PATTERN"; then
+              echo "::error::Potential secret detected matching pattern: ${PATTERN:0:10}..."
+              FOUND=true
+            fi
+          done
+
+          if [ "$FOUND" = "true" ]; then
+            echo "secrets_found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "secrets_found=false" >> "$GITHUB_OUTPUT"
+          fi
+
       # ── T1.5: Push fix (branch for novel, main for pattern-matched) ──
       - name: Push fix
-        if: steps.loop-guard.outputs.skip != 'true' && steps.test-fix.outputs.tests_passed == 'true'
+        if: steps.loop-guard.outputs.skip != 'true' && steps.test-fix.outputs.tests_passed == 'true' && steps.secret-scan.outputs.secrets_found != 'true'
         id: push
         working-directory: target-repo
         env:
