@@ -27,7 +27,8 @@ export async function pollVercel(): Promise<void> {
     const res = await fetch(url.toString(), { headers });
 
     if (!res.ok) {
-      log('warn', `Vercel API error: ${res.status}`);
+      const body = await res.text().catch(() => '');
+      log('warn', `Vercel API error: ${res.status} ${body.substring(0, 100)}. Note: vcp_ project tokens cannot list all deployments — use a personal token from vercel.com/account/tokens`);
       recordHealth('vercel', { status: 'error', error: `API ${res.status}`, checked_at: new Date().toISOString() });
       return;
     }
