@@ -88,7 +88,7 @@ healthRoutes.get('/health/platforms', (c) => {
   return c.json({
     platforms: [
       'github', 'render', 'stripe', 'supabase',
-      'vercel', 'cloudflare', 'agents', 'domains',
+      'vercel', 'cloudflare', 'agents', 'domains', 'cto-self',
     ],
   });
 });

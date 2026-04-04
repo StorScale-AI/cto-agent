@@ -9,6 +9,7 @@ import { pollVercel } from './pollers/vercel.js';
 import { pollCloudflare } from './pollers/cloudflare.js';
 import { pollAgentHealth } from './pollers/agents.js';
 import { pollDomains } from './pollers/domains.js';
+import { pollSelfHealth } from './pollers/self-health.js';
 import { healthRoutes } from './health-api.js';
 import { log } from './lib/logger.js';
 
@@ -31,6 +32,7 @@ const POLL_INTERVALS = {
   vercel: 5 * 60 * 1000,       // 5 min
   cloudflare: 5 * 60 * 1000,   // 5 min
   agents: 10 * 60 * 1000,      // 10 min
+  selfHealth: 15 * 60 * 1000,   // 15 min — CTO agent self-monitoring
   domains: 24 * 60 * 60 * 1000, // daily
 };
 
@@ -89,6 +91,12 @@ async function startPollers() {
     catch (e) { log('error', `Domain poller failed: ${e}`); }
   }, POLL_INTERVALS.domains);
 
+  // Self-health poller — the CTO agent monitors itself
+  setInterval(async () => {
+    try { await pollSelfHealth(repos); }
+    catch (e) { log('error', `Self-health poller failed: ${e}`); }
+  }, POLL_INTERVALS.selfHealth);
+
   // Repo discovery refresh
   setInterval(async () => {
     try {
@@ -107,6 +115,7 @@ async function startPollers() {
     pollCloudflare(),
     pollAgentHealth(),
     pollDomains(),
+    pollSelfHealth(repos),
   ]);
 
   log('info', 'All pollers initialized');
